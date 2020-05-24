@@ -1,13 +1,16 @@
 from __future__ import division
 
+import os
 import sys
 import math
 import random
 import time
+import json
 
 from collections import deque
+import pyglet
+from pyglet import gl
 from pyglet import image
-from pyglet.gl import *
 from pyglet.graphics import TextureGroup
 from pyglet.window import key, mouse
 
@@ -32,6 +35,8 @@ JUMP_SPEED = math.sqrt(2 * GRAVITY * MAX_JUMP_HEIGHT)
 TERMINAL_VELOCITY = 50
 
 PLAYER_HEIGHT = 2
+
+database = 'world.db'
 
 if sys.version_info[0] >= 3:
     xrange = range
@@ -76,10 +81,21 @@ def tex_coords(top, bottom, side):
 
 TEXTURE_PATH = 'texture.png'
 
-GRASS = tex_coords((1, 0), (0, 1), (0, 0))
-SAND = tex_coords((1, 1), (1, 1), (1, 1))
-BRICK = tex_coords((2, 0), (2, 0), (2, 0))
-STONE = tex_coords((2, 1), (2, 1), (2, 1))
+BLOCKS = {
+    'grass': tex_coords((1, 0), (0, 1), (0, 0)),
+    'sand' : tex_coords((1, 1), (1, 1), (1, 1)),
+    'brick': tex_coords((2, 0), (2, 0), (2, 0)),
+    'stone': tex_coords((2, 1), (2, 1), (2, 1)),
+    'brown': tex_coords((0, 1), (0, 1), (0, 1)),
+    'green': tex_coords((1, 0), (1, 0), (1, 0)),
+    'water': tex_coords((0, 2), (0, 2), (0, 2)),
+    'full_green': tex_coords((1, 2), (1, 2), (1, 2)),
+    'full_red': tex_coords((2, 2), (2, 2), (2, 2)),
+    'full_white': tex_coords((0, 3), (0, 3), (0, 3)),
+    'full_black': tex_coords((1, 3), (1, 3), (1, 3)),
+    'full_yellow': tex_coords((2, 3), (2, 3), (2, 3)),
+    }
+
 
 FACES = [
     ( 0, 1, 0),
@@ -133,7 +149,7 @@ class Model(object):
         # A Batch is a collection of vertex lists for batched rendering.
         self.batch = pyglet.graphics.Batch()
 
-        # A TextureGroup manages an OpenGL texture.
+        # A TextureGroup manages an Opengl.GL texture.
         self.group = TextureGroup(image.load(TEXTURE_PATH).get_texture())
 
         # A mapping from position to the texture of the block at that position.
@@ -143,7 +159,7 @@ class Model(object):
         # Same mapping as `world` but only contains blocks that are shown.
         self.shown = {}
 
-        # Mapping from position to a pyglet `VertextList` for all shown blocks.
+        # Mapping from position to a pygl.glet `VertextList` for all shown blocks.
         self._shown = {}
 
         # Mapping from sector to a list of positions inside that sector.
@@ -153,24 +169,32 @@ class Model(object):
         # _show_block() and _hide_block() calls
         self.queue = deque()
 
+        self.commands = []
+        self.undo_position = -1
+
         self._initialize()
 
     def _initialize(self):
         """ Initialize the world by placing all the blocks.
 
         """
+        if os.path.exists(database):
+            self.load()
+            return
+
         n = 80  # 1/2 width and height of world
         s = 1  # step size
         y = 0  # initial y height
         for x in xrange(-n, n + 1, s):
             for z in xrange(-n, n + 1, s):
                 # create a layer stone an grass everywhere.
-                self.add_block((x, y - 2, z), GRASS, immediate=False)
-                self.add_block((x, y - 3, z), STONE, immediate=False)
+                self.add_block((x, y - 2, z), BLOCKS['grass'], immediate=False)
+                self.add_block((x, y - 3, z), BLOCKS['stone'], immediate=False)
                 if x in (-n, n) or z in (-n, n):
                     # create outer walls.
                     for dy in xrange(-2, 3):
-                        self.add_block((x, y + dy, z), STONE, immediate=False)
+                        self.add_block((x, y + dy, z), BLOCKS['stone'],
+                            immediate=False)
 
         # generate the hills randomly
         o = n - 10
@@ -181,7 +205,7 @@ class Model(object):
             h = random.randint(1, 6)  # height of the hill
             s = random.randint(4, 8)  # 2 * s is the side length of the hill
             d = 1  # how quickly to taper off the hills
-            t = random.choice([GRASS, SAND, BRICK])
+            t = random.choice([BLOCKS['grass'], BLOCKS['sand'], BLOCKS['brick']])
             for y in xrange(c, c + h):
                 for x in xrange(a - s, a + s + 1):
                     for z in xrange(b - s, b + s + 1):
@@ -191,6 +215,16 @@ class Model(object):
                             continue
                         self.add_block((x, y, z), t, immediate=False)
                 s -= d  # decrement side lenth so hills taper off
+
+    def load(self):
+        with open(database, 'r') as f:
+            blocks = json.load(f)
+        for position, texture in blocks:
+            self.add_block(tuple(position), texture, immediate=False)
+
+    def save(self):
+        with open(database, 'w') as f:
+            json.dump([(p, t) for p, t in self.world.items()], f)
 
     def hit_test(self, position, vector, max_distance=8):
         """ Line of sight search from current position. If a block is
@@ -230,7 +264,7 @@ class Model(object):
                 return True
         return False
 
-    def add_block(self, position, texture, immediate=True):
+    def add_block(self, position, texture, immediate=True, undo=False):
         """ Add a block with the given `texture` and `position` to the world.
 
         Parameters
@@ -252,8 +286,12 @@ class Model(object):
             if self.exposed(position):
                 self.show_block(position)
             self.check_neighbors(position)
+            if not undo:
+                self.commands = []
+                self.undo_position = -1
+                #self.commands.append(('add', position, texture))
 
-    def remove_block(self, position, immediate=True):
+    def remove_block(self, position, immediate=True, undo=False):
         """ Remove the block at the given `position`.
 
         Parameters
@@ -264,12 +302,39 @@ class Model(object):
             Whether or not to immediately remove block from canvas.
 
         """
+        #texture = self.world[position]
         del self.world[position]
         self.sectors[sectorize(position)].remove(position)
         if immediate:
             if position in self.shown:
                 self.hide_block(position)
             self.check_neighbors(position)
+            if not undo:
+                self.commands = []
+                self.undo_position = -1
+                #self.commands.append(('remove', position, texture))
+
+    def undo(self):
+        try:
+            command = self.commands[self.undo_position]
+        except IndexError:
+            return
+        self.undo_position -= 1
+        if command[0] == 'add':
+            self.remove_block(command[1], undo=True)
+        else:
+            self.add_block(command[1], command[2], undo=True)
+
+    def redo(self):
+        try:
+            command = self.commands[self.undo_position]
+        except IndexError:
+            return
+        self.undo_position += 1
+        if command[0] == 'add':
+            self.add_block(command[1], command[2], undo=True)
+        else:
+            self.remove_block(command[1], undo=True)
 
     def check_neighbors(self, position):
         """ Check all blocks surrounding `position` and ensure their visual
@@ -326,7 +391,7 @@ class Model(object):
         texture_data = list(texture)
         # create vertex list
         # FIXME Maybe `add_indexed()` should be used instead
-        self._shown[position] = self.batch.add(24, GL_QUADS, self.group,
+        self._shown[position] = self.batch.add(24, gl.GL_QUADS, self.group,
             ('v3f/static', vertex_data),
             ('t2f/static', texture_data))
 
@@ -456,7 +521,7 @@ class Window(pyglet.window.Window):
 
         # First element is rotation of the player in the x-z plane (ground
         # plane) measured from the z-axis down. The second is the rotation
-        # angle from the ground plane up. Rotation is in degrees.
+        # angl.gle from the ground plane up. Rotation is in degrees.
         #
         # The vertical plane rotation ranges from -90 (looking straight down) to
         # 90 (looking straight up). The horizontal rotation range is unbounded.
@@ -472,15 +537,23 @@ class Window(pyglet.window.Window):
         self.dy = 0
 
         # A list of blocks the player can place. Hit num keys to cycle.
-        self.inventory = [BRICK, GRASS, SAND]
+        self.inventory = list(BLOCKS.values())
 
         # The current block the user can place. Hit num keys to cycle.
         self.block = self.inventory[0]
-
-        # Convenience list of num keys.
-        self.num_keys = [
-            key._1, key._2, key._3, key._4, key._5,
-            key._6, key._7, key._8, key._9, key._0]
+        self.current_block = '00'
+        self.num_keys = {
+            key._0: '0',
+            key._1: '1',
+            key._2: '2',
+            key._3: '3',
+            key._4: '4',
+            key._5: '5',
+            key._6: '6',
+            key._7: '7',
+            key._8: '8',
+            key._9: '9',
+            }
 
         # Instance of the model that handles the world.
         self.model = Model()
@@ -559,7 +632,7 @@ class Window(pyglet.window.Window):
         return (dx, dy, dz)
 
     def update(self, dt):
-        """ This method is scheduled to be called repeatedly by the pyglet
+        """ This method is scheduled to be called repeatedly by the pygl.glet
         clock.
 
         Parameters
@@ -656,7 +729,7 @@ class Window(pyglet.window.Window):
         return tuple(p)
 
     def on_mouse_press(self, x, y, button, modifiers):
-        """ Called when a mouse button is pressed. See pyglet docs for button
+        """ Called when a mouse button is pressed. See pygl.glet docs for button
         amd modifier mappings.
 
         Parameters
@@ -681,9 +754,11 @@ class Window(pyglet.window.Window):
                 if previous:
                     self.model.add_block(previous, self.block)
             elif button == pyglet.window.mouse.LEFT and block:
-                texture = self.model.world[block]
-                if texture != STONE:
-                    self.model.remove_block(block)
+                # This prevented the removal of STONEs
+                #texture = self.model.world[block]
+                #if texture != STONE:
+                    #self.model.remove_block(block)
+                self.model.remove_block(block)
         else:
             self.set_exclusive_mouse(True)
 
@@ -707,7 +782,7 @@ class Window(pyglet.window.Window):
             self.rotation = (x, y)
 
     def on_key_press(self, symbol, modifiers):
-        """ Called when the player presses a key. See pyglet docs for key
+        """ Called when the player presses a key. See pygl.glet docs for key
         mappings.
 
         Parameters
@@ -731,14 +806,26 @@ class Window(pyglet.window.Window):
                 self.dy = JUMP_SPEED
         elif symbol == key.ESCAPE:
             self.set_exclusive_mouse(False)
+            self.model.save()
         elif symbol == key.TAB:
             self.flying = not self.flying
         elif symbol in self.num_keys:
-            index = (symbol - self.num_keys[0]) % len(self.inventory)
-            self.block = self.inventory[index]
+            if len(self.current_block) >= 2:
+                self.current_block = ''
+            self.current_block += self.num_keys[symbol]
+            if len(self.current_block) == 2:
+                current = int(self.current_block) % len(self.inventory)
+                self.block = self.inventory[current]
+                self.current_block = '%02d' % current
+        elif symbol == key.O:
+            self.position = (0, 0, 0)
+        elif symbol == key.U:
+            self.model.undo()
+        elif symbol == key.R:
+            self.model.redo()
 
     def on_key_release(self, symbol, modifiers):
-        """ Called when the player releases a key. See pyglet docs for key
+        """ Called when the player releases a key. See pygl.glet docs for key
         mappings.
 
         Parameters
@@ -774,45 +861,45 @@ class Window(pyglet.window.Window):
         )
 
     def set_2d(self):
-        """ Configure OpenGL to draw in 2d.
+        """ Configure Opengl.GL to draw in 2d.
 
         """
         width, height = self.get_size()
-        glDisable(GL_DEPTH_TEST)
+        gl.glDisable(gl.GL_DEPTH_TEST)
         viewport = self.get_viewport_size()
-        glViewport(0, 0, max(1, viewport[0]), max(1, viewport[1]))
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        glOrtho(0, max(1, width), 0, max(1, height), -1, 1)
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
+        gl.glViewport(0, 0, max(1, viewport[0]), max(1, viewport[1]))
+        gl.glMatrixMode(gl.GL_PROJECTION)
+        gl.glLoadIdentity()
+        gl.glOrtho(0, max(1, width), 0, max(1, height), -1, 1)
+        gl.glMatrixMode(gl.GL_MODELVIEW)
+        gl.glLoadIdentity()
 
     def set_3d(self):
-        """ Configure OpenGL to draw in 3d.
+        """ Configure Opengl.GL to draw in 3d.
 
         """
         width, height = self.get_size()
-        glEnable(GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_DEPTH_TEST)
         viewport = self.get_viewport_size()
-        glViewport(0, 0, max(1, viewport[0]), max(1, viewport[1]))
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        gluPerspective(65.0, width / float(height), 0.1, 60.0)
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
+        gl.glViewport(0, 0, max(1, viewport[0]), max(1, viewport[1]))
+        gl.glMatrixMode(gl.GL_PROJECTION)
+        gl.glLoadIdentity()
+        gl.gluPerspective(65.0, width / float(height), 0.1, 60.0)
+        gl.glMatrixMode(gl.GL_MODELVIEW)
+        gl.glLoadIdentity()
         x, y = self.rotation
-        glRotatef(x, 0, 1, 0)
-        glRotatef(-y, math.cos(math.radians(x)), 0, math.sin(math.radians(x)))
+        gl.glRotatef(x, 0, 1, 0)
+        gl.glRotatef(-y, math.cos(math.radians(x)), 0, math.sin(math.radians(x)))
         x, y, z = self.position
-        glTranslatef(-x, -y, -z)
+        gl.glTranslatef(-x, -y, -z)
 
     def on_draw(self):
-        """ Called by pyglet to draw the canvas.
+        """ Called by pygl.glet to draw the canvas.
 
         """
         self.clear()
         self.set_3d()
-        glColor3d(1, 1, 1)
+        gl.glColor3d(1, 1, 1)
         self.model.batch.draw()
         self.draw_focused_block()
         self.set_2d()
@@ -829,69 +916,75 @@ class Window(pyglet.window.Window):
         if block:
             x, y, z = block
             vertex_data = cube_vertices(x, y, z, 0.51)
-            glColor3d(0, 0, 0)
-            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
-            pyglet.graphics.draw(24, GL_QUADS, ('v3f/static', vertex_data))
-            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+            gl.glColor3d(0, 0, 0)
+            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
+            pyglet.graphics.draw(24, gl.GL_QUADS, ('v3f/static', vertex_data))
+            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
     def draw_label(self):
         """ Draw the label in the top left of the screen.
 
         """
         x, y, z = self.position
-        self.label.text = '%02d (%.2f, %.2f, %.2f) %d / %d' % (
+        self.label.text = '%02d (%.2f, %.2f, %.2f) %d / %d | Texture: %s' % (
             pyglet.clock.get_fps(), x, y, z,
-            len(self.model._shown), len(self.model.world))
+            len(self.model._shown), len(self.model.world),
+            self.current_block)
         self.label.draw()
 
     def draw_reticle(self):
         """ Draw the crosshairs in the center of the screen.
 
         """
-        glColor3d(0, 0, 0)
-        self.reticle.draw(GL_LINES)
+        gl.glColor3d(0, 0, 0)
+        self.reticle.draw(gl.GL_LINES)
 
 
 def setup_fog():
-    """ Configure the OpenGL fog properties.
+    """ Configure the Opengl.GL fog properties.
 
     """
     # Enable fog. Fog "blends a fog color with each rasterized pixel fragment's
     # post-texturing color."
-    glEnable(GL_FOG)
+    gl.glEnable(gl.GL_FOG)
     # Set the fog color.
-    glFogfv(GL_FOG_COLOR, (GLfloat * 4)(0.5, 0.69, 1.0, 1))
+    gl.glFogfv(gl.GL_FOG_COLOR, (gl.GLfloat * 4)(0.5, 0.69, 1.0, 1))
     # Say we have no preference between rendering speed and quality.
-    glHint(GL_FOG_HINT, GL_DONT_CARE)
+    gl.glHint(gl.GL_FOG_HINT, gl.GL_DONT_CARE)
     # Specify the equation used to compute the blending factor.
-    glFogi(GL_FOG_MODE, GL_LINEAR)
+    gl.glFogi(gl.GL_FOG_MODE, gl.GL_LINEAR)
     # How close and far away fog starts and ends. The closer the start and end,
     # the denser the fog in the fog range.
-    glFogf(GL_FOG_START, 20.0)
-    glFogf(GL_FOG_END, 60.0)
+    gl.glFogf(gl.GL_FOG_START, 20.0)
+    gl.glFogf(gl.GL_FOG_END, 60.0)
 
 
 def setup():
-    """ Basic OpenGL configuration.
+    """ Basic Opengl.GL configuration.
 
     """
     # Set the color of "clear", i.e. the sky, in rgba.
-    glClearColor(0.5, 0.69, 1.0, 1)
+    gl.glClearColor(0.5, 0.69, 1.0, 1)
     # Enable culling (not rendering) of back-facing facets -- facets that aren't
     # visible to you.
-    glEnable(GL_CULL_FACE)
-    # Set the texture minification/magnification function to GL_NEAREST (nearest
-    # in Manhattan distance) to the specified texture coordinates. GL_NEAREST
-    # "is generally faster than GL_LINEAR, but it can produce textured images
+    gl.glEnable(gl.GL_CULL_FACE)
+    # Set the texture minification/magnification function to gl.GL_NEAREST (nearest
+    # in Manhattan distance) to the specified texture coordinates. gl.GL_NEAREST
+    # "is generally faster than gl.GL_LINEAR, but it can produce textured images
     # with sharper edges because the transition between texture elements is not
     # as smooth."
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
     setup_fog()
 
 
 def main():
-    window = Window(width=800, height=600, caption='Pyglet', resizable=True)
+    global database
+    if len(sys.argv) > 1:
+        database = sys.argv[1]
+    else:
+        database = 'default.db'
+    window = Window(width=800, height=600, caption='Pygl.glet', resizable=True)
     # Hide the mouse cursor and prevent the mouse from leaving the window.
     window.set_exclusive_mouse(True)
     setup()
